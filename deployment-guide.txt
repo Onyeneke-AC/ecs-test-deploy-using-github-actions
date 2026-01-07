@@ -1,0 +1,2095 @@
+# Complete Guide: Deploy 4 Services to ECS Fargate Using CloudFormation
+
+## **Architecture Overview**
+
+Same architecture as before, but now deployed using Infrastructure as Code (CloudFormation).
+
+```
+Infrastructure managed by CloudFormation:
+- VPC with public/private subnets
+- NAT Gateway or VPC Endpoints
+- Security Groups
+- Application Load Balancer
+- ECS Cluster
+- Service Discovery
+- IAM Roles
+- Task Definitions
+- ECS Services
+```
+
+---
+
+## **Table of Contents**
+
+1. [Prerequisites](#prerequisites)
+2. [Project Structure](#project-structure)
+3. [CloudFormation Templates](#cloudformation-templates)
+4. [Deployment Steps](#deployment-steps)
+5. [GitHub Actions Setup](#github-actions-setup)
+6. [Testing](#testing)
+7. [Updates and Rollbacks](#updates-and-rollbacks)
+
+---
+
+## **PART 1: Prerequisites**
+
+### **Required Tools:**
+
+```bash
+# Install AWS CLI
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
+# Configure AWS CLI
+aws configure
+# Enter: Access Key ID, Secret Access Key, Region (us-east-1), Output format (json)
+
+# Install Docker
+sudo apt-get update
+sudo apt-get install docker.io
+
+# Verify
+aws --version
+docker --version
+```
+
+---
+
+## **PART 2: Project Structure**
+
+```bash
+my-project/
+├── infrastructure/
+│   ├── cloudformation/
+│   │   ├── 1-network.yaml
+│   │   ├── 2-security-groups.yaml
+│   │   ├── 3-ecr.yaml
+│   │   ├── 4-ecs-cluster.yaml
+│   │   ├── 5-alb.yaml
+│   │   ├── 6-service-discovery.yaml
+│   │   ├── 7-iam-roles.yaml
+│   │   ├── 8-task-definitions.yaml
+│   │   └── 9-ecs-services.yaml
+│   ├── scripts/
+│   │   ├── deploy-stack.sh
+│   │   ├── update-stack.sh
+│   │   └── push-placeholders.sh
+│   └── parameters/
+│       ├── network-params.json
+│       ├── services-params.json
+│       └── production.json
+├── .github/
+│   └── workflows/
+│       ├── deploy-frontend.yml
+│       ├── deploy-auth.yml
+│       ├── deploy-users.yml
+│       └── deploy-tasks.yml
+├── services/
+│   ├── frontend/
+│   ├── auth/
+│   ├── users/
+│   └── tasks/
+└── README.md
+```
+
+---
+
+## **PART 3: CloudFormation Templates**
+
+### **Template 1: Network Infrastructure** (`infrastructure/cloudformation/1-network.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'VPC with public and private subnets across 2 AZs with NAT Gateway'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+    
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+    
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR for public subnet in AZ1
+    
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR for public subnet in AZ2
+    
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.11.0/24
+    Description: CIDR for private subnet in AZ1
+    
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.12.0/24
+    Description: CIDR for private subnet in AZ2
+    
+  UseVPCEndpoints:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Use VPC Endpoints instead of NAT Gateway (cheaper)
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-2
+
+  # Private Subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-2
+
+  # NAT Gateways (Conditional - only if not using VPC endpoints)
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    Condition: UseNATGateway
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-eip-1
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    Condition: UseNATGateway
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-eip-2
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNATGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNATGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-2
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-routes-1
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Condition: UseNATGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-routes-2
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Condition: UseNATGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # VPC Endpoints (Conditional - only if UseVPCEndpoints is true)
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseVPCEndpoints
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-vpce-sg
+      GroupDescription: Security group for VPC Endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpce-sg
+
+  # S3 Gateway Endpoint (Free)
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseVPCEndpoints
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+      VpcEndpointType: Gateway
+
+  # ECR API Endpoint
+  ECRApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseVPCEndpoints
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # ECR Docker Endpoint
+  ECRDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseVPCEndpoints
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # CloudWatch Logs Endpoint
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseVPCEndpoints
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+Conditions:
+  UseNATGateway: !Equals [!Ref UseVPCEndpoints, 'false']
+  UseVPCEndpoints: !Equals [!Ref UseVPCEndpoints, 'true']
+
+Outputs:
+  VPC:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${EnvironmentName}-VPC
+
+  PublicSubnets:
+    Description: Public subnets
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub ${EnvironmentName}-PublicSubnets
+
+  PrivateSubnets:
+    Description: Private subnets
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub ${EnvironmentName}-PrivateSubnets
+
+  PublicSubnet1:
+    Description: Public Subnet 1 ID
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub ${EnvironmentName}-PublicSubnet1
+
+  PublicSubnet2:
+    Description: Public Subnet 2 ID
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub ${EnvironmentName}-PublicSubnet2
+
+  PrivateSubnet1:
+    Description: Private Subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub ${EnvironmentName}-PrivateSubnet1
+
+  PrivateSubnet2:
+    Description: Private Subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub ${EnvironmentName}-PrivateSubnet2
+
+  VPCEndpointSecurityGroup:
+    Condition: UseVPCEndpoints
+    Description: VPC Endpoint Security Group
+    Value: !Ref VPCEndpointSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-VPCEndpointSG
+```
+
+---
+
+### **Template 2: Security Groups** (`infrastructure/cloudformation/2-security-groups.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Groups for ECS Services'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+
+Resources:
+  # ALB Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-alb-sg
+      GroupDescription: Security group for Application Load Balancer
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS from internet
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-sg
+
+  # Frontend Security Group
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-frontend-sg
+      GroupDescription: Security group for frontend service
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow traffic from ALB
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-frontend-sg
+
+  # Auth Service Security Group
+  AuthSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-auth-sg
+      GroupDescription: Security group for auth service (internal only)
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-auth-sg
+
+  # Users Service Security Group
+  UsersSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-users-sg
+      GroupDescription: Security group for users service
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4000
+          ToPort: 4000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow traffic from ALB
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-users-sg
+
+  # Tasks Service Security Group
+  TasksSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-tasks-sg
+      GroupDescription: Security group for tasks service
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow traffic from ALB
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-tasks-sg
+
+  # Auth Service Ingress Rules (from other services)
+  AuthIngressFromFrontend:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AuthSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6000
+      ToPort: 6000
+      SourceSecurityGroupId: !Ref FrontendSecurityGroup
+      Description: Allow from Frontend
+
+  AuthIngressFromUsers:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AuthSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6000
+      ToPort: 6000
+      SourceSecurityGroupId: !Ref UsersSecurityGroup
+      Description: Allow from Users
+
+  AuthIngressFromTasks:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AuthSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6000
+      ToPort: 6000
+      SourceSecurityGroupId: !Ref TasksSecurityGroup
+      Description: Allow from Tasks
+
+Outputs:
+  ALBSecurityGroup:
+    Description: ALB Security Group ID
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-ALB-SG
+
+  FrontendSecurityGroup:
+    Description: Frontend Security Group ID
+    Value: !Ref FrontendSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-Frontend-SG
+
+  AuthSecurityGroup:
+    Description: Auth Security Group ID
+    Value: !Ref AuthSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-Auth-SG
+
+  UsersSecurityGroup:
+    Description: Users Security Group ID
+    Value: !Ref UsersSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-Users-SG
+
+  TasksSecurityGroup:
+    Description: Tasks Security Group ID
+    Value: !Ref TasksSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-Tasks-SG
+```
+
+---
+
+### **Template 3: ECR Repositories** (`infrastructure/cloudformation/3-ecr.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECR Repositories for microservices'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+
+Resources:
+  FrontendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: frontend-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-frontend-repo
+
+  AuthRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: auth-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-auth-repo
+
+  UsersRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: users-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-users-repo
+
+  TasksRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: tasks-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-tasks-repo
+
+Outputs:
+  FrontendRepositoryUri:
+    Description: Frontend ECR Repository URI
+    Value: !GetAtt FrontendRepository.RepositoryUri
+    Export:
+      Name: !Sub ${EnvironmentName}-Frontend-ECR-URI
+
+  AuthRepositoryUri:
+    Description: Auth ECR Repository URI
+    Value: !GetAtt AuthRepository.RepositoryUri
+    Export:
+      Name: !Sub ${EnvironmentName}-Auth-ECR-URI
+
+  UsersRepositoryUri:
+    Description: Users ECR Repository URI
+    Value: !GetAtt UsersRepository.RepositoryUri
+    Export:
+      Name: !Sub ${EnvironmentName}-Users-ECR-URI
+
+  TasksRepositoryUri:
+    Description: Tasks ECR Repository URI
+    Value: !GetAtt TasksRepository.RepositoryUri
+    Export:
+      Name: !Sub ${EnvironmentName}-Tasks-ECR-URI
+```
+
+---
+
+### **Template 4: ECS Cluster** (`infrastructure/cloudformation/4-ecs-cluster.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Cluster for microservices'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-cluster
+
+Outputs:
+  ECSCluster:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${EnvironmentName}-ECS-Cluster
+
+  ECSClusterArn:
+    Description: ECS Cluster ARN
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ECS-Cluster-ARN
+```
+
+---
+
+### **Template 5: Application Load Balancer** (`infrastructure/cloudformation/5-alb.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Application Load Balancer with Target Groups'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+
+Resources:
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet1
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet2
+      SecurityGroups:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-ALB-SG
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb
+
+  # Target Groups
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-frontend-tg
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-frontend-tg
+
+  UsersTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-users-tg
+      Port: 4000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      HealthCheckEnabled: true
+      HealthCheckPath: /api/users/health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-users-tg
+
+  TasksTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-tasks-tg
+      Port: 5000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      HealthCheckEnabled: true
+      HealthCheckPath: /api/tasks/health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-tasks-tg
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  # Listener Rules
+  TasksListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/tasks*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TasksTargetGroup
+
+  UsersListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/users*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref UsersTargetGroup
+
+Outputs:
+  LoadBalancerUrl:
+    Description: ALB DNS Name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${EnvironmentName}-ALB-URL
+
+  LoadBalancerArn:
+    Description: ALB ARN
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub ${EnvironmentName}-ALB-ARN
+
+  FrontendTargetGroupArn:
+    Description: Frontend Target Group ARN
+    Value: !Ref FrontendTargetGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-Frontend-TG-ARN
+
+  UsersTargetGroupArn:
+    Description: Users Target Group ARN
+    Value: !Ref UsersTargetGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-Users-TG-ARN
+
+  TasksTargetGroupArn:
+    Description: Tasks Target Group ARN
+    Value: !Ref TasksTargetGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-Tasks-TG-ARN
+```
+
+---
+
+### **Template 6: Service Discovery** (`infrastructure/cloudformation/6-service-discovery.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Service Discovery for internal microservices communication'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+
+Resources:
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Properties:
+      Name: !Sub ${EnvironmentName}.local
+      Description: Service discovery namespace for microservices
+
+  AuthServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: auth
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 60
+        RoutingPolicy: MULTIVALUE
+
+Outputs:
+  ServiceDiscoveryNamespaceId:
+    Description: Service Discovery Namespace ID
+    Value: !Ref ServiceDiscoveryNamespace
+    Export:
+      Name: !Sub ${EnvironmentName}-SD-Namespace-ID
+
+  ServiceDiscoveryNamespaceName:
+    Description: Service Discovery Namespace Name
+    Value: !GetAtt ServiceDiscoveryNamespace.Id
+    Export:
+      Name: !Sub ${EnvironmentName}-SD-Namespace-Name
+
+  AuthServiceDiscoveryServiceArn:
+    Description: Auth Service Discovery Service ARN
+    Value: !GetAtt AuthServiceDiscoveryService.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-Auth-SD-Service-ARN
+
+  AuthServiceDiscoveryServiceId:
+    Description: Auth Service Discovery Service ID
+    Value: !Ref AuthServiceDiscoveryService
+    Export:
+      Name: !Sub ${EnvironmentName}-Auth-SD-Service-ID
+```
+
+---
+
+### **Template 7: IAM Roles** (`infrastructure/cloudformation/7-iam-roles.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Roles for ECS Tasks'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+
+Resources:
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ecs-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ECS Task Role (for application permissions)
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: '*'
+
+Outputs:
+  ECSTaskExecutionRoleArn:
+    Description: ECS Task Execution Role ARN
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ECS-Task-Execution-Role-ARN
+
+  ECSTaskRoleArn:
+    Description: ECS Task Role ARN
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ECS-Task-Role-ARN
+```
+
+---
+
+### **Template 8: Task Definitions** (`infrastructure/cloudformation/8-task-definitions.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Task Definitions for all services'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+    
+  FrontendImageTag:
+    Type: String
+    Default: latest
+    Description: Frontend image tag
+    
+  AuthImageTag:
+    Type: String
+    Default: latest
+    Description: Auth image tag
+    
+  UsersImageTag:
+    Type: String
+    Default: latest
+    Description: Users image tag
+    
+  TasksImageTag:
+    Type: String
+    Default: latest
+    Description: Tasks image tag
+
+Resources:
+  # CloudWatch Log Groups
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}/frontend
+      RetentionInDays: 7
+
+  AuthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}/auth
+      RetentionInDays: 7
+
+  UsersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}/users
+      RetentionInDays: 7
+
+  TasksLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}/tasks
+      RetentionInDays: 7
+
+  # Frontend Task Definition
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-frontend-task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Task-Execution-Role-ARN
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Task-Role-ARN
+      ContainerDefinitions:
+        - Name: frontend-container
+          Image: !Sub
+            - '${ECRUri}:${ImageTag}'
+            - ECRUri:
+                Fn::ImportValue: !Sub ${EnvironmentName}-Frontend-ECR-URI
+              ImageTag: !Ref FrontendImageTag
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: '3000'
+            - Name: AUTH_SERVICE_URL
+              Value: !Sub http://auth.${EnvironmentName}.local:6000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # Auth Task Definition
+  AuthTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-auth-task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Task-Execution-Role-ARN
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Task-Role-ARN
+      ContainerDefinitions:
+        - Name: auth-container
+          Image: !Sub
+            - '${ECRUri}:${ImageTag}'
+            - ECRUri:
+                Fn::ImportValue: !Sub ${EnvironmentName}-Auth-ECR-URI
+              ImageTag: !Ref AuthImageTag
+          Essential: true
+          PortMappings:
+            - ContainerPort: 6000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: '6000'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AuthLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # Users Task Definition
+  UsersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-users-task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Task-Execution-Role-ARN
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Task-Role-ARN
+      ContainerDefinitions:
+        - Name: users-container
+          Image: !Sub
+            - '${ECRUri}:${ImageTag}'
+            - ECRUri:
+                Fn::ImportValue: !Sub ${EnvironmentName}-Users-ECR-URI
+              ImageTag: !Ref UsersImageTag
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: '4000'
+            - Name: AUTH_SERVICE_URL
+              Value: !Sub http://auth.${EnvironmentName}.local:6000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref UsersLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # Tasks Task Definition
+  TasksTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-tasks-task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Task-Execution-Role-ARN
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Task-Role-ARN
+      ContainerDefinitions:
+        - Name: tasks-container
+          Image: !Sub
+            - '${ECRUri}:${ImageTag}'
+            - ECRUri:
+                Fn::ImportValue: !Sub ${EnvironmentName}-Tasks-ECR-URI
+              ImageTag: !Ref TasksImageTag
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: '5000'
+            - Name: AUTH_SERVICE_URL
+              Value: !Sub http://auth.${EnvironmentName}.local:6000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TasksLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+Outputs:
+  FrontendTaskDefinitionArn:
+    Description: Frontend Task Definition ARN
+    Value: !Ref FrontendTaskDefinition
+    Export:
+      Name: !Sub ${EnvironmentName}-Frontend-Task-Definition-ARN
+
+  AuthTaskDefinitionArn:
+    Description: Auth Task Definition ARN
+    Value: !Ref AuthTaskDefinition
+    Export:
+      Name: !Sub ${EnvironmentName}-Auth-Task-Definition-ARN
+
+  UsersTaskDefinitionArn:
+    Description: Users Task Definition ARN
+    Value: !Ref UsersTaskDefinition
+    Export:
+      Name: !Sub ${EnvironmentName}-Users-Task-Definition-ARN
+
+  TasksTaskDefinitionArn:
+    Description: Tasks Task Definition ARN
+    Value: !Ref TasksTaskDefinition
+    Export:
+      Name: !Sub ${EnvironmentName}-Tasks-Task-Definition-ARN
+```
+
+---
+
+### **Template 9: ECS Services** (`infrastructure/cloudformation/9-ecs-services.yaml`)
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Services for all microservices'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix
+    
+  FrontendDesiredCount:
+    Type: Number
+    Default: 2
+    Description: Number of frontend tasks
+    
+  AuthDesiredCount:
+    Type: Number
+    Default: 2
+    Description: Number of auth tasks
+    
+  UsersDesiredCount:
+    Type: Number
+    Default: 2
+    Description: Number of users tasks
+    
+  TasksDesiredCount:
+    Type: Number
+    Default: 2
+    Description: Number of tasks tasks
+
+Resources:
+  # Frontend Service
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListenerRule
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-frontend-service
+      Cluster:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Cluster
+      TaskDefinition:
+        Fn::ImportValue: !Sub ${EnvironmentName}-Frontend-Task-Definition-ARN
+      DesiredCount: !Ref FrontendDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-Frontend-SG
+      LoadBalancers:
+        - ContainerName: frontend-container
+          ContainerPort: 3000
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${EnvironmentName}-Frontend-TG-ARN
+      HealthCheckGracePeriodSeconds: 60
+
+  # Auth Service (Internal - with Service Discovery)
+  AuthService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-auth-service
+      Cluster:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Cluster
+      TaskDefinition:
+        Fn::ImportValue: !Sub ${EnvironmentName}-Auth-Task-Definition-ARN
+      DesiredCount: !Ref AuthDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-Auth-SG
+      ServiceRegistries:
+        - RegistryArn:
+            Fn::ImportValue: !Sub ${EnvironmentName}-Auth-SD-Service-ARN
+
+  # Users Service
+  UsersService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListenerRule
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-users-service
+      Cluster:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Cluster
+      TaskDefinition:
+        Fn::ImportValue: !Sub ${EnvironmentName}-Users-Task-Definition-ARN
+      DesiredCount: !Ref UsersDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-Users-SG
+      LoadBalancers:
+        - ContainerName: users-container
+          ContainerPort: 4000
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${EnvironmentName}-Users-TG-ARN
+      HealthCheckGracePeriodSeconds: 60
+
+  # Tasks Service
+  TasksService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListenerRule
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-tasks-service
+      Cluster:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ECS-Cluster
+      TaskDefinition:
+        Fn::ImportValue: !Sub ${EnvironmentName}-Tasks-Task-Definition-ARN
+      DesiredCount: !Ref TasksDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-Tasks-SG
+      LoadBalancers:
+        - ContainerName: tasks-container
+          ContainerPort: 5000
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${EnvironmentName}-Tasks-TG-ARN
+      HealthCheckGracePeriodSeconds: 60
+
+  # Dummy resource to satisfy DependsOn
+  ALBListenerRule:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+Outputs:
+  FrontendServiceName:
+    Description: Frontend Service Name
+    Value: !GetAtt FrontendService.Name
+    Export:
+      Name: !Sub ${EnvironmentName}-Frontend-Service-Name
+
+  AuthServiceName:
+    Description: Auth Service Name
+    Value: !GetAtt AuthService.Name
+    Export:
+      Name: !Sub ${EnvironmentName}-Auth-Service-Name
+
+  UsersServiceName:
+    Description: Users Service Name
+    Value: !GetAtt UsersService.Name
+    Export:
+      Name: !Sub ${EnvironmentName}-Users-Service-Name
+
+  TasksServiceName:
+    Description: Tasks Service Name
+    Value: !GetAtt TasksService.Name
+    Export:
+      Name: !Sub ${EnvironmentName}-Tasks-Service-Name
+```
+
+---
+
+## **PART 4: Deployment Scripts**
+
+### **Deploy Script** (`infrastructure/scripts/deploy-stack.sh`)
+
+```bash
+#!/bin/bash
+
+set -e
+
+ENVIRONMENT=${1:-production}
+REGION=${2:-us-east-1}
+
+echo "========================================="
+echo "Deploying Infrastructure to $ENVIRONMENT"
+echo "Region: $REGION"
+echo "========================================="
+
+# Deploy stacks in order
+echo ""
+echo "1. Deploying Network Stack..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-network \
+  --template-body file://cloudformation/1-network.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+               ParameterKey=UseVPCEndpoints,ParameterValue=true \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-network \
+  --region ${REGION}
+echo "✅ Network stack deployed"
+
+echo ""
+echo "2. Deploying Security Groups..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-security-groups \
+  --template-body file://cloudformation/2-security-groups.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-security-groups \
+  --region ${REGION}
+echo "✅ Security groups deployed"
+
+echo ""
+echo "3. Deploying ECR Repositories..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-ecr \
+  --template-body file://cloudformation/3-ecr.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-ecr \
+  --region ${REGION}
+echo "✅ ECR repositories created"
+
+echo ""
+echo "4. Deploying ECS Cluster..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-ecs-cluster \
+  --template-body file://cloudformation/4-ecs-cluster.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-ecs-cluster \
+  --region ${REGION}
+echo "✅ ECS cluster created"
+
+echo ""
+echo "5. Deploying Application Load Balancer..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-alb \
+  --template-body file://cloudformation/5-alb.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-alb \
+  --region ${REGION}
+echo "✅ ALB deployed"
+
+echo ""
+echo "6. Deploying Service Discovery..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-service-discovery \
+  --template-body file://cloudformation/6-service-discovery.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-service-discovery \
+  --region ${REGION}
+echo "✅ Service Discovery deployed"
+
+echo ""
+echo "7. Deploying IAM Roles..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-iam-roles \
+  --template-body file://cloudformation/7-iam-roles.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-iam-roles \
+  --region ${REGION}
+echo "✅ IAM roles created"
+
+echo ""
+echo "========================================="
+echo "✅ Infrastructure deployment complete!"
+echo "========================================="
+echo ""
+echo "Next steps:"
+echo "1. Run: ./push-placeholders.sh to push initial Docker images"
+echo "2. Deploy task definitions and services"
+echo ""
+
+# Get ALB URL
+ALB_URL=$(aws cloudformation describe-stacks \
+  --stack-name ${ENVIRONMENT}-alb \
+  --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerUrl`].OutputValue' \
+  --output text \
+  --region ${REGION})
+
+echo "ALB URL: http://${ALB_URL}"
+```
+
+Make it executable:
+```bash
+chmod +x infrastructure/scripts/deploy-stack.sh
+```
+
+---
+
+### **Push Placeholders Script** (`infrastructure/scripts/push-placeholders.sh`)
+
+```bash
+#!/bin/bash
+
+set -e
+
+ENVIRONMENT=${1:-production}
+REGION=${2:-us-east-1}
+
+echo "========================================="
+echo "Pushing Placeholder Images"
+echo "Environment: $ENVIRONMENT"
+echo "Region: $REGION"
+echo "========================================="
+
+# Get AWS Account ID
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+echo "AWS Account ID: $AWS_ACCOUNT_ID"
+
+# Login to ECR
+echo ""
+echo "Logging in to ECR..."
+aws ecr get-login-password --region $REGION | \
+  docker login --username AWS --password-stdin \
+  ${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com
+
+# Function to create and push placeholder
+push_placeholder() {
+  local SERVICE_NAME=$1
+  local PORT=$2
+  local HEALTH_PATH=$3
+  
+  echo ""
+  echo "Building placeholder for $SERVICE_NAME..."
+  
+  TEMP_DIR=$(mktemp -d)
+  cd $TEMP_DIR
+  
+  # Create files
+  cat > package.json <<EOF
+{
+  "name": "$SERVICE_NAME-placeholder",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
+EOF
+
+  cat > index.js <<EOF
+const express = require('express');
+const app = express();
+
+app.get('$HEALTH_PATH', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    service: '$SERVICE_NAME',
+    message: 'Placeholder - will be replaced by CI/CD'
+  });
+});
+
+app.get('/', (req, res) => {
+  res.send('<h1>$SERVICE_NAME</h1><p>Placeholder image</p>');
+});
+
+app.listen($PORT, '0.0.0.0', () => {
+  console.log('$SERVICE_NAME running on port $PORT');
+});
+EOF
+
+  cat > Dockerfile <<EOF
+FROM node:18-alpine
+WORKDIR /app
+COPY package.json ./
+RUN npm install --production
+COPY index.js ./
+EXPOSE $PORT
+CMD ["node", "index.js"]
+EOF
+
+  # Build and push
+  docker build -t $SERVICE_NAME:placeholder .
+  docker tag $SERVICE_NAME:placeholder \
+    ${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/$SERVICE_NAME:latest
+  docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/$SERVICE_NAME:latest
+  
+  cd -
+  rm -rf $TEMP_DIR
+  
+  echo "✅ $SERVICE_NAME pushed"
+}
+
+# Push all placeholders
+push_placeholder "frontend-service" "3000" "/"
+push_placeholder "auth-service" "6000" "/health"
+push_placeholder "users-service" "4000" "/api/users/health"
+push_placeholder "tasks-service" "5000" "/api/tasks/health"
+
+echo ""
+echo "========================================="
+echo "✅ All placeholder images pushed!"
+echo "========================================="
+```
+
+Make it executable:
+```bash
+chmod +x infrastructure/scripts/push-placeholders.sh
+```
+
+---
+
+### **Deploy Services Script** (`infrastructure/scripts/deploy-services.sh`)
+
+```bash
+#!/bin/bash
+
+set -e
+
+ENVIRONMENT=${1:-production}
+REGION=${2:-us-east-1}
+
+echo "========================================="
+echo "Deploying ECS Services"
+echo "Environment: $ENVIRONMENT"
+echo "========================================="
+
+echo ""
+echo "1. Deploying Task Definitions..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-task-definitions \
+  --template-body file://cloudformation/8-task-definitions.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-task-definitions \
+  --region ${REGION}
+echo "✅ Task definitions created"
+
+echo ""
+echo "2. Deploying ECS Services..."
+aws cloudformation create-stack \
+  --stack-name ${ENVIRONMENT}-ecs-services \
+  --template-body file://cloudformation/9-ecs-services.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+               ParameterKey=FrontendDesiredCount,ParameterValue=2 \
+               ParameterKey=AuthDesiredCount,ParameterValue=2 \
+               ParameterKey=UsersDesiredCount,ParameterValue=2 \
+               ParameterKey=TasksDesiredCount,ParameterValue=2 \
+  --region ${REGION}
+
+aws cloudformation wait stack-create-complete \
+  --stack-name ${ENVIRONMENT}-ecs-services \
+  --region ${REGION}
+echo "✅ ECS services deployed"
+
+echo ""
+echo "========================================="
+echo "✅ All services deployed!"
+echo "========================================="
+
+# Get ALB URL
+ALB_URL=$(aws cloudformation describe-stacks \
+  --stack-name ${ENVIRONMENT}-alb \
+  --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerUrl`].OutputValue' \
+  --output text \
+  --region ${REGION})
+
+echo ""
+echo "Test your deployment:"
+echo "  curl http://${ALB_URL}/"
+echo "  curl http://${ALB_URL}/api/users/health"
+echo "  curl http://${ALB_URL}/api/tasks/health"
+```
+
+Make it executable:
+```bash
+chmod +x infrastructure/scripts/deploy-services.sh
+```
+
+---
+
+## **PART 5: Complete Deployment Steps**
+
+### **Step 1: Clone and Setup Project**
+
+```bash
+# Create project structure
+mkdir -p my-project/{infrastructure/{cloudformation,scripts,parameters},services/{frontend,auth,users,tasks},.github/workflows}
+cd my-project
+```
+
+### **Step 2: Add CloudFormation Templates**
+
+Copy all the CloudFormation templates (1-9) into `infrastructure/cloudformation/`
+
+### **Step 3: Add Deployment Scripts**
+
+Copy all scripts into `infrastructure/scripts/` and make them executable:
+
+```bash
+chmod +x infrastructure/scripts/*.sh
+```
+
+### **Step 4: Deploy Infrastructure**
+
+```bash
+cd infrastructure/scripts
+
+# Deploy base infrastructure
+./deploy-stack.sh production us-east-1
+```
+
+This will take **15-20 minutes** to complete.
+
+### **Step 5: Push Placeholder Images**
+
+```bash
+# Push placeholder images to ECR
+./push-placeholders.sh production us-east-1
+```
+
+### **Step 6: Deploy Services**
+
+```bash
+# Deploy task definitions and ECS services
+./deploy-services.sh production us-east-1
+```
+
+### **Step 7: Verify Deployment**
+
+```bash
+# Get ALB URL
+ALB_URL=$(aws cloudformation describe-stacks \
+  --stack-name production-alb \
+  --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerUrl`].OutputValue' \
+  --output text \
+  --region us-east-1)
+
+echo "ALB URL: http://${ALB_URL}"
+
+# Test services
+curl http://${ALB_URL}/
+curl http://${ALB_URL}/api/users/health
+curl http://${ALB_URL}/api/tasks/health
+```
+
+---
+
+## **PART 6: GitHub Actions (Updated for CloudFormation)**
+
+### **Updated Frontend Workflow** (`.github/workflows/deploy-frontend.yml`)
+
+```yaml
+name: Deploy Frontend Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: production
+  ECR_REPOSITORY: frontend-service
+  ECS_SERVICE: production-frontend-service
+  ECS_CLUSTER: production-cluster
+  CONTAINER_NAME: frontend-container
+
+jobs:
+  deploy:
+    name: Deploy Frontend
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build, tag, and push image
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        cd services/frontend
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Update CloudFormation stack with new image
+      run: |
+        aws cloudformation update-stack \
+          --stack-name ${ENVIRONMENT}-task-definitions \
+          --template-body file://infrastructure/cloudformation/8-task-definitions.yaml \
+          --parameters ParameterKey=EnvironmentName,ParameterValue=${ENVIRONMENT} \
+                       ParameterKey=FrontendImageTag,ParameterValue=${{ github.sha }} \
+                       ParameterKey=AuthImageTag,UsePreviousValue=true \
+                       ParameterKey=UsersImageTag,UsePreviousValue=true \
+                       ParameterKey=TasksImageTag,UsePreviousValue=true \
+          --region ${{ env.AWS_REGION }}
+        
+        aws cloudformation wait stack-update-complete \
+          --stack-name ${ENVIRONMENT}-task-definitions \
+          --region ${{ env.AWS_REGION }}
+
+    - name: Force new deployment
+      run: |
+        aws ecs update-service \
+          --cluster ${ECS_CLUSTER} \
+          --service ${ECS_SERVICE} \
+          --force-new-deployment \
+          --region ${{ env.AWS_REGION }}
+
+    - name: Wait for service stability
+      run: |
+        aws ecs wait services-stable \
+          --cluster ${ECS_CLUSTER} \
+          --services ${ECS_SERVICE} \
+          --region ${{ env.AWS_REGION }}
+
+    - name: Deployment summary
+      run: |
+        echo "✅ Frontend deployed successfully!"
+        echo "Image: ${{ steps.build-image.outputs.image }}"
+```
+
+Create similar workflows for auth, users, and tasks services.
+
+---
+
+## **PART 7: Stack Updates and Rollbacks**
+
+### **Update Stack**
+
+```bash
+# Update network stack
+aws cloudformation update-stack \
+  --stack-name production-network \
+  --template-body file://cloudformation/1-network.yaml \
+  --parameters ParameterKey=EnvironmentName,ParameterValue=production \
+  --region us-east-1
+```
+
+### **Rollback**
+
+```bash
+# Rollback to previous version
+aws cloudformation cancel-update-stack \
+  --stack-name production-task-definitions \
+  --region us-east-1
+```
+
+### **Delete Stacks (in reverse order)**
+
+```bash
+aws cloudformation delete-stack --stack-name production-ecs-services
+aws cloudformation delete-stack --stack-name production-task-definitions
+aws cloudformation delete-stack --stack-name production-iam-roles
+aws cloudformation delete-stack --stack-name production-service-discovery
+aws cloudformation delete-stack --stack-name production-alb
+aws cloudformation delete-stack --stack-name production-ecs-cluster
+aws cloudformation delete-stack --stack-name production-ecr
+aws cloudformation delete-stack --stack-name production-security-groups
+aws cloudformation delete-stack --stack-name production-network
+```
+
+---
+
+## **Summary**
+
+✅ **Full Infrastructure as Code** using CloudFormation  
+✅ **9 modular templates** for easy maintenance  
+✅ **Automated deployment scripts**  
+✅ **VPC with private subnets** for ECS tasks  
+✅ **VPC Endpoints** for cost-effective AWS service access  
+✅ **Service Discovery** for internal communication  
+✅ **GitHub Actions** integrated with CloudFormation  
+✅ **Easy rollbacks** and updates  
+✅ **Reproducible** across environments  
+
+**Benefits of CloudFormation approach:**
+- Version control for infrastructure
+- Automated and repeatable deployments
+- Easy to replicate across environments (dev, staging, prod)
+- Built-in rollback capabilities
+- Change sets for safe updates
+- No manual console clicking
+
+**Total deployment time:** ~20-25 minutes for initial setup
+
+Need help with:
+1. Setting up CI/CD for all services?
+2. Adding auto-scaling with CloudFormation?
+3. Creating staging environment?
+4. Adding RDS database to stack?

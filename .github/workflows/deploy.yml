@@ -1,0 +1,186 @@
+name: Deploy to Amazon ECS
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'eu-west-1' }}
+  ENVIRONMENT_NAME: ${{ secrets.ENVIRONMENT_NAME || 'ecs-trial' }}
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION || 'eu-west-1' }}.amazonaws.com
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy Services
+    runs-on: ubuntu-latest
+
+    # Use matrix to build multiple services in parallel
+    strategy:
+      matrix:
+        service: [auth, users, tasks, frontend]
+      fail-fast: false # Continue even if one service fails
+
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Step 3: Login to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Step 4: Set up Docker Buildx (for better caching)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 5: Build and push Docker image
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-${{ matrix.service }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Building ${{ matrix.service }} service..."
+
+          # Check if service directory exists
+          if [ ! -d "${{ matrix.service }}-service" ]; then
+            echo "Error: ${{ matrix.service }}-service directory not found"
+            exit 1
+          fi
+
+          # Build Docker image
+          docker build \
+            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
+            ./${{ matrix.service }}-service
+
+          # Push both tags to ECR
+          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+
+          # Output image URI for next steps
+          echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+          echo "✓ Successfully built and pushed ${{ matrix.service }} image"
+
+      # Step 6: Download current task definition
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ENVIRONMENT_NAME }}-${{ matrix.service }} \
+            --query taskDefinition > task-definition.json
+
+          echo "✓ Downloaded current task definition for ${{ matrix.service }}"
+
+      # Step 7: Fill in the new image ID in the task definition
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ matrix.service }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      # Step 8: Deploy to Amazon ECS
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ENVIRONMENT_NAME }}-${{ matrix.service }}-service
+          cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
+          wait-for-service-stability: true
+
+      # Step 9: Verify deployment
+      - name: Verify deployment
+        run: |
+          echo "Checking deployment status for ${{ matrix.service }}..."
+
+          aws ecs describe-services \
+            --cluster ${{ env.ENVIRONMENT_NAME }}-cluster \
+            --services ${{ env.ENVIRONMENT_NAME }}-${{ matrix.service }}-service \
+            --query 'services[0].deployments[*].[id,status,runningCount,desiredCount]' \
+            --output table
+
+          echo "✓ Deployment verification complete for ${{ matrix.service }}"
+
+      # Step 10: Post deployment logs URL
+      - name: Post CloudWatch Logs URL
+        if: always()
+        run: |
+          echo "📊 CloudWatch Logs:"
+          echo "https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.ENVIRONMENT_NAME }}"
+
+  # Separate job to report overall deployment status
+  deployment-summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    if: always()
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Application Load Balancer DNS
+        id: get-alb-dns
+        run: |
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.ENVIRONMENT_NAME }}-alb \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerDNS`].OutputValue' \
+            --output text)
+
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "✓ Retrieved ALB DNS: $ALB_DNS"
+
+      - name: Display deployment summary
+        run: |
+          echo "=========================================="
+          echo "  Deployment Summary"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ env.ENVIRONMENT_NAME }}"
+          echo "Region: ${{ env.AWS_REGION }}"
+          echo "Commit: ${{ github.sha }}"
+          echo ""
+          echo "Application URL: http://${{ steps.get-alb-dns.outputs.alb_dns }}"
+          echo ""
+          echo "Test endpoints:"
+          echo "  • Frontend: http://${{ steps.get-alb-dns.outputs.alb_dns }}/"
+          echo "  • Users:    http://${{ steps.get-alb-dns.outputs.alb_dns }}/signup"
+          echo "  • Tasks:    http://${{ steps.get-alb-dns.outputs.alb_dns }}/tasks"
+          echo ""
+          echo "Monitor deployment:"
+          echo "  aws ecs describe-services --cluster ${{ env.ENVIRONMENT_NAME }}-cluster --services ${{ env.ENVIRONMENT_NAME }}-auth-service"
+          echo "  aws logs tail /ecs/${{ env.ENVIRONMENT_NAME }} --follow"
+          echo ""
+          echo "=========================================="
+
+      - name: Check deployment status
+        if: ${{ needs.build-and-deploy.result == 'success' }}
+        run: |
+          echo "✅ All services deployed successfully!"
+
+      - name: Check deployment failures
+        if: ${{ needs.build-and-deploy.result != 'success' }}
+        run: |
+          echo "❌ Some services failed to deploy. Check the logs above."
+          exit 1
