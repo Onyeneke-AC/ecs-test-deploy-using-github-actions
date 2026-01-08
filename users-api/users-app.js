@@ -38,9 +38,7 @@ app.post("/signup", async (req, res) => {
     // const hashedPW = 'dummy text';
     // since it's a dummy service, we don't really care for the hashed-pw either
     console.log(hashedPW, email);
-    res
-      .status(201)
-      .json({ message: "User created!Hmmm Agba Chef and cook !!!" });
+    res.status(201).json({ message: "User created! Agba Chef and cook !!!" });
   } catch (err) {
     console.log(err);
     return res
