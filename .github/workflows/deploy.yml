@@ -15,13 +15,7 @@ on:
         required: false
         default: "all"
 
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION || 'eu-west-1' }}
-  ENVIRONMENT_NAME: ${{ secrets.ENVIRONMENT_NAME || 'ecs-trial' }}
-  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION || 'eu-west-1' }}.amazonaws.com
-
 jobs:
-  # Job 1: Detect which services changed
   detect-changes:
     name: Detect Changed Services
     runs-on: ubuntu-latest
@@ -30,7 +24,6 @@ jobs:
       users: ${{ steps.filter.outputs.users }}
       tasks: ${{ steps.filter.outputs.tasks }}
       frontend: ${{ steps.filter.outputs.frontend }}
-      any_change: ${{ steps.filter.outputs.changes }}
 
     steps:
       - name: Checkout code
@@ -42,17 +35,13 @@ jobs:
         with:
           filters: |
             auth:
-              - 'auth-service/**'
-              - 'Dockerfile.auth'
+              - 'auth-api/**'
             users:
-              - 'users-service/**'
-              - 'Dockerfile.users'
+              - 'users-api/**'
             tasks:
-              - 'tasks-service/**'
-              - 'Dockerfile.tasks'
+              - 'tasks-api/**'
             frontend:
               - 'frontend/**'
-              - 'Dockerfile.frontend'
 
       - name: Display detected changes
         run: |
@@ -62,7 +51,6 @@ jobs:
           echo "Tasks changed: ${{ steps.filter.outputs.tasks }}"
           echo "Frontend changed: ${{ steps.filter.outputs.frontend }}"
 
-  # Job 2: Build and Deploy Auth Service
   deploy-auth:
     name: Deploy Auth Service
     runs-on: ubuntu-latest
@@ -81,34 +69,34 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: eu-west-1
 
       - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Auth image
         id: build-auth
         env:
-          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-auth
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           echo "🔨 Building Auth service..."
           docker build \
-            -f Dockerfile.auth \
-            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
-            ./auth-service
+            -t $ECR_REGISTRY/my-trial-app-auth:$IMAGE_TAG \
+            -t $ECR_REGISTRY/my-trial-app-auth:latest \
+            ./auth-api
 
-          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/my-trial-app-auth:$IMAGE_TAG
+          docker push $ECR_REGISTRY/my-trial-app-auth:latest
 
-          echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image=$ECR_REGISTRY/my-trial-app-auth:$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "✅ Auth image built and pushed"
 
       - name: Download Auth task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition ${{ env.ENVIRONMENT_NAME }}-auth \
+            --task-definition ecs-trial-auth \
             --query taskDefinition > task-definition.json
 
       - name: Update Auth task definition
@@ -123,14 +111,13 @@ jobs:
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def-auth.outputs.task-definition }}
-          service: ${{ env.ENVIRONMENT_NAME }}-auth-service
-          cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
+          service: ecs-trial-auth-service
+          cluster: ecs-trial-cluster
           wait-for-service-stability: true
 
       - name: Auth deployment complete
         run: echo "✅ Auth service deployed successfully"
 
-  # Job 3: Build and Deploy Users Service
   deploy-users:
     name: Deploy Users Service
     runs-on: ubuntu-latest
@@ -149,34 +136,34 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: eu-west-1
 
       - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Users image
         id: build-users
         env:
-          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-users
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           echo "🔨 Building Users service..."
           docker build \
-            -f Dockerfile.users \
-            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
-            ./users-service
+            -t $ECR_REGISTRY/my-trial-app-users:$IMAGE_TAG \
+            -t $ECR_REGISTRY/my-trial-app-users:latest \
+            ./users-api
 
-          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/my-trial-app-users:$IMAGE_TAG
+          docker push $ECR_REGISTRY/my-trial-app-users:latest
 
-          echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image=$ECR_REGISTRY/my-trial-app-users:$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "✅ Users image built and pushed"
 
       - name: Download Users task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition ${{ env.ENVIRONMENT_NAME }}-users \
+            --task-definition ecs-trial-users \
             --query taskDefinition > task-definition.json
 
       - name: Update Users task definition
@@ -191,14 +178,13 @@ jobs:
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def-users.outputs.task-definition }}
-          service: ${{ env.ENVIRONMENT_NAME }}-users-service
-          cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
+          service: ecs-trial-users-service
+          cluster: ecs-trial-cluster
           wait-for-service-stability: true
 
       - name: Users deployment complete
         run: echo "✅ Users service deployed successfully"
 
-  # Job 4: Build and Deploy Tasks Service
   deploy-tasks:
     name: Deploy Tasks Service
     runs-on: ubuntu-latest
@@ -217,34 +203,34 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: eu-west-1
 
       - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Tasks image
         id: build-tasks
         env:
-          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-tasks
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           echo "🔨 Building Tasks service..."
           docker build \
-            -f Dockerfile.tasks \
-            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
-            ./tasks-service
+            -t $ECR_REGISTRY/my-trial-app-tasks:$IMAGE_TAG \
+            -t $ECR_REGISTRY/my-trial-app-tasks:latest \
+            ./tasks-api
 
-          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/my-trial-app-tasks:$IMAGE_TAG
+          docker push $ECR_REGISTRY/my-trial-app-tasks:latest
 
-          echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image=$ECR_REGISTRY/my-trial-app-tasks:$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "✅ Tasks image built and pushed"
 
       - name: Download Tasks task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition ${{ env.ENVIRONMENT_NAME }}-tasks \
+            --task-definition ecs-trial-tasks \
             --query taskDefinition > task-definition.json
 
       - name: Update Tasks task definition
@@ -259,14 +245,13 @@ jobs:
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def-tasks.outputs.task-definition }}
-          service: ${{ env.ENVIRONMENT_NAME }}-tasks-service
-          cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
+          service: ecs-trial-tasks-service
+          cluster: ecs-trial-cluster
           wait-for-service-stability: true
 
       - name: Tasks deployment complete
         run: echo "✅ Tasks service deployed successfully"
 
-  # Job 5: Build and Deploy Frontend
   deploy-frontend:
     name: Deploy Frontend
     runs-on: ubuntu-latest
@@ -285,34 +270,34 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: eu-west-1
 
       - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Frontend image
         id: build-frontend
         env:
-          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-frontend
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           echo "🔨 Building Frontend..."
           docker build \
-            -f Dockerfile.frontend \
-            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
+            -t $ECR_REGISTRY/my-trial-app-frontend:$IMAGE_TAG \
+            -t $ECR_REGISTRY/my-trial-app-frontend:latest \
             ./frontend
 
-          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/my-trial-app-frontend:$IMAGE_TAG
+          docker push $ECR_REGISTRY/my-trial-app-frontend:latest
 
-          echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image=$ECR_REGISTRY/my-trial-app-frontend:$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "✅ Frontend image built and pushed"
 
       - name: Download Frontend task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition ${{ env.ENVIRONMENT_NAME }}-frontend \
+            --task-definition ecs-trial-frontend \
             --query taskDefinition > task-definition.json
 
       - name: Update Frontend task definition
@@ -327,14 +312,13 @@ jobs:
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def-frontend.outputs.task-definition }}
-          service: ${{ env.ENVIRONMENT_NAME }}-frontend-service
-          cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
+          service: ecs-trial-frontend-service
+          cluster: ecs-trial-cluster
           wait-for-service-stability: true
 
       - name: Frontend deployment complete
         run: echo "✅ Frontend deployed successfully"
 
-  # Job 6: Deployment Summary
   deployment-summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
@@ -348,13 +332,13 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: eu-west-1
 
       - name: Get ALB DNS
         id: get-alb
         run: |
           ALB_DNS=$(aws elbv2 describe-load-balancers \
-            --query "LoadBalancers[?contains(LoadBalancerName, '${{ env.ENVIRONMENT_NAME }}')].DNSName" \
+            --query "LoadBalancers[?contains(LoadBalancerName, 'ecs-trial')].DNSName" \
             --output text | head -n1)
           echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
 
@@ -370,12 +354,15 @@ jobs:
           echo "  • Tasks:    ${{ needs.deploy-tasks.result }}"
           echo "  • Frontend: ${{ needs.deploy-frontend.result }}"
           echo ""
-          echo "Application URL: http://${{ steps.get-alb.outputs.alb_dns }}"
-          echo ""
           echo "Changed Services:"
           echo "  • Auth:     ${{ needs.detect-changes.outputs.auth }}"
           echo "  • Users:    ${{ needs.detect-changes.outputs.users }}"
           echo "  • Tasks:    ${{ needs.detect-changes.outputs.tasks }}"
           echo "  • Frontend: ${{ needs.detect-changes.outputs.frontend }}"
+          echo ""
+          echo "Application URL: http://${{ steps.get-alb.outputs.alb_dns }}"
+          echo ""
+          echo "CloudWatch Logs:"
+          echo "https://console.aws.amazon.com/cloudwatch/home?region=eu-west-1#logsV2:log-groups/log-group/%2Fecs%2Fecs-trial"
           echo ""
           echo "=========================================="
