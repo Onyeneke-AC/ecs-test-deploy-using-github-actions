@@ -61,9 +61,10 @@ app.get(["/tasks", "/api/tasks"], async (req, res) => {
       entries.pop();
       console.log(entries);
       const tasks = entries.map((json) => JSON.parse(json));
-      res
-        .status(200)
-        .json({ message: "Tasks loaded. I too good", tasks: tasks });
+      res.status(200).json({
+        message: "Tasks loaded. I too good. No be lie my brotherrr",
+        tasks: tasks,
+      });
     });
   } catch (err) {
     console.log(err);
@@ -89,7 +90,10 @@ app.post(["/tasks", "/api/tasks"], async (req, res) => {
       }
       res
         .status(201)
-        .json({ message: "Task stored. Crazyyy.", createdTask: task });
+        .json({
+          message: "Task stored. Crazyyy and maddddd.",
+          createdTask: task,
+        });
     });
   } catch (err) {
     return res.status(401).json({ message: "Could not verify token." });

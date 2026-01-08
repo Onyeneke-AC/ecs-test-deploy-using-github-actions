@@ -31,7 +31,12 @@ app.get("/token/:hashedPassword/:enteredPassword", (req, res) => {
   // dummy password verification!
   if (hashedPassword === enteredPassword + "_hash") {
     const token = "abc";
-    return res.status(200).json({ message: "Token created.", token: token });
+    return res
+      .status(200)
+      .json({
+        message: "Token created. Jor jor jor you dey cook abeg",
+        token: token,
+      });
   }
   res.status(401).json({ message: "Passwords do not match." });
 });
