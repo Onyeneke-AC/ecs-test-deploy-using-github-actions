@@ -1,4 +1,4 @@
-name: Deploy to Amazon ECS
+name: Smart Deploy to ECS
 
 on:
   push:
@@ -8,7 +8,12 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch: # Allows manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to deploy (comma-separated: auth,users,tasks,frontend or "all")'
+        required: false
+        default: "all"
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION || 'eu-west-1' }}
@@ -16,22 +21,61 @@ env:
   ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION || 'eu-west-1' }}.amazonaws.com
 
 jobs:
-  build-and-deploy:
-    name: Build and Deploy Services
+  # Job 1: Detect which services changed
+  detect-changes:
+    name: Detect Changed Services
     runs-on: ubuntu-latest
-
-    # Use matrix to build multiple services in parallel
-    strategy:
-      matrix:
-        service: [auth, users, tasks, frontend]
-      fail-fast: false # Continue even if one service fails
+    outputs:
+      auth: ${{ steps.filter.outputs.auth }}
+      users: ${{ steps.filter.outputs.users }}
+      tasks: ${{ steps.filter.outputs.tasks }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      any_change: ${{ steps.filter.outputs.changes }}
 
     steps:
-      # Step 1: Checkout code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2: Configure AWS credentials
+      - name: Check for file changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            auth:
+              - 'auth-service/**'
+              - 'Dockerfile.auth'
+            users:
+              - 'users-service/**'
+              - 'Dockerfile.users'
+            tasks:
+              - 'tasks-service/**'
+              - 'Dockerfile.tasks'
+            frontend:
+              - 'frontend/**'
+              - 'Dockerfile.frontend'
+
+      - name: Display detected changes
+        run: |
+          echo "🔍 Change Detection Results:"
+          echo "Auth changed: ${{ steps.filter.outputs.auth }}"
+          echo "Users changed: ${{ steps.filter.outputs.users }}"
+          echo "Tasks changed: ${{ steps.filter.outputs.tasks }}"
+          echo "Frontend changed: ${{ steps.filter.outputs.frontend }}"
+
+  # Job 2: Build and Deploy Auth Service
+  deploy-auth:
+    name: Deploy Auth Service
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.auth == 'true' || 
+      github.event_name == 'workflow_dispatch' && 
+      (contains(github.event.inputs.services, 'auth') || github.event.inputs.services == 'all')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -39,97 +83,263 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Login to Amazon ECR
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Step 4: Set up Docker Buildx (for better caching)
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Step 5: Build and push Docker image
-      - name: Build, tag, and push image to Amazon ECR
-        id: build-image
+      - name: Build and push Auth image
+        id: build-auth
         env:
-          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-${{ matrix.service }}
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-auth
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          echo "Building ${{ matrix.service }} service..."
-
-          # Check if service directory exists
-          if [ ! -d "${{ matrix.service }}-service" ]; then
-            echo "Error: ${{ matrix.service }}-service directory not found"
-            exit 1
-          fi
-
-          # Build Docker image
+          echo "🔨 Building Auth service..."
           docker build \
+            -f Dockerfile.auth \
             -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
             -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
-            ./${{ matrix.service }}-service
+            ./auth-service
 
-          # Push both tags to ECR
           docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
           docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
 
-          # Output image URI for next steps
           echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "✅ Auth image built and pushed"
 
-          echo "✓ Successfully built and pushed ${{ matrix.service }} image"
-
-      # Step 6: Download current task definition
-      - name: Download task definition
+      - name: Download Auth task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition ${{ env.ENVIRONMENT_NAME }}-${{ matrix.service }} \
+            --task-definition ${{ env.ENVIRONMENT_NAME }}-auth \
             --query taskDefinition > task-definition.json
 
-          echo "✓ Downloaded current task definition for ${{ matrix.service }}"
-
-      # Step 7: Fill in the new image ID in the task definition
-      - name: Update task definition with new image
-        id: task-def
+      - name: Update Auth task definition
+        id: task-def-auth
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
-          container-name: ${{ matrix.service }}
-          image: ${{ steps.build-image.outputs.image }}
+          container-name: auth
+          image: ${{ steps.build-auth.outputs.image }}
 
-      # Step 8: Deploy to Amazon ECS
-      - name: Deploy Amazon ECS task definition
+      - name: Deploy Auth to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ENVIRONMENT_NAME }}-${{ matrix.service }}-service
+          task-definition: ${{ steps.task-def-auth.outputs.task-definition }}
+          service: ${{ env.ENVIRONMENT_NAME }}-auth-service
           cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
           wait-for-service-stability: true
 
-      # Step 9: Verify deployment
-      - name: Verify deployment
+      - name: Auth deployment complete
+        run: echo "✅ Auth service deployed successfully"
+
+  # Job 3: Build and Deploy Users Service
+  deploy-users:
+    name: Deploy Users Service
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.users == 'true' || 
+      github.event_name == 'workflow_dispatch' && 
+      (contains(github.event.inputs.services, 'users') || github.event.inputs.services == 'all')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Users image
+        id: build-users
+        env:
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-users
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          echo "Checking deployment status for ${{ matrix.service }}..."
+          echo "🔨 Building Users service..."
+          docker build \
+            -f Dockerfile.users \
+            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
+            ./users-service
 
-          aws ecs describe-services \
-            --cluster ${{ env.ENVIRONMENT_NAME }}-cluster \
-            --services ${{ env.ENVIRONMENT_NAME }}-${{ matrix.service }}-service \
-            --query 'services[0].deployments[*].[id,status,runningCount,desiredCount]' \
-            --output table
+          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
 
-          echo "✓ Deployment verification complete for ${{ matrix.service }}"
+          echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "✅ Users image built and pushed"
 
-      # Step 10: Post deployment logs URL
-      - name: Post CloudWatch Logs URL
-        if: always()
+      - name: Download Users task definition
         run: |
-          echo "📊 CloudWatch Logs:"
-          echo "https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/%2Fecs%2F${{ env.ENVIRONMENT_NAME }}"
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ENVIRONMENT_NAME }}-users \
+            --query taskDefinition > task-definition.json
 
-  # Separate job to report overall deployment status
+      - name: Update Users task definition
+        id: task-def-users
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: users
+          image: ${{ steps.build-users.outputs.image }}
+
+      - name: Deploy Users to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-users.outputs.task-definition }}
+          service: ${{ env.ENVIRONMENT_NAME }}-users-service
+          cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
+          wait-for-service-stability: true
+
+      - name: Users deployment complete
+        run: echo "✅ Users service deployed successfully"
+
+  # Job 4: Build and Deploy Tasks Service
+  deploy-tasks:
+    name: Deploy Tasks Service
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.tasks == 'true' || 
+      github.event_name == 'workflow_dispatch' && 
+      (contains(github.event.inputs.services, 'tasks') || github.event.inputs.services == 'all')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Tasks image
+        id: build-tasks
+        env:
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-tasks
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "🔨 Building Tasks service..."
+          docker build \
+            -f Dockerfile.tasks \
+            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
+            ./tasks-service
+
+          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+
+          echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "✅ Tasks image built and pushed"
+
+      - name: Download Tasks task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ENVIRONMENT_NAME }}-tasks \
+            --query taskDefinition > task-definition.json
+
+      - name: Update Tasks task definition
+        id: task-def-tasks
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: tasks
+          image: ${{ steps.build-tasks.outputs.image }}
+
+      - name: Deploy Tasks to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-tasks.outputs.task-definition }}
+          service: ${{ env.ENVIRONMENT_NAME }}-tasks-service
+          cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
+          wait-for-service-stability: true
+
+      - name: Tasks deployment complete
+        run: echo "✅ Tasks service deployed successfully"
+
+  # Job 5: Build and Deploy Frontend
+  deploy-frontend:
+    name: Deploy Frontend
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.frontend == 'true' || 
+      github.event_name == 'workflow_dispatch' && 
+      (contains(github.event.inputs.services, 'frontend') || github.event.inputs.services == 'all')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Frontend image
+        id: build-frontend
+        env:
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT_NAME }}-frontend
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "🔨 Building Frontend..."
+          docker build \
+            -f Dockerfile.frontend \
+            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest \
+            ./frontend
+
+          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+
+          echo "image=${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "✅ Frontend image built and pushed"
+
+      - name: Download Frontend task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ENVIRONMENT_NAME }}-frontend \
+            --query taskDefinition > task-definition.json
+
+      - name: Update Frontend task definition
+        id: task-def-frontend
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: frontend
+          image: ${{ steps.build-frontend.outputs.image }}
+
+      - name: Deploy Frontend to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-frontend.outputs.task-definition }}
+          service: ${{ env.ENVIRONMENT_NAME }}-frontend-service
+          cluster: ${{ env.ENVIRONMENT_NAME }}-cluster
+          wait-for-service-stability: true
+
+      - name: Frontend deployment complete
+        run: echo "✅ Frontend deployed successfully"
+
+  # Job 6: Deployment Summary
   deployment-summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: build-and-deploy
+    needs:
+      [detect-changes, deploy-auth, deploy-users, deploy-tasks, deploy-frontend]
     if: always()
 
     steps:
@@ -140,47 +350,32 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get Application Load Balancer DNS
-        id: get-alb-dns
+      - name: Get ALB DNS
+        id: get-alb
         run: |
-          ALB_DNS=$(aws cloudformation describe-stacks \
-            --stack-name ${{ env.ENVIRONMENT_NAME }}-alb \
-            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerDNS`].OutputValue' \
-            --output text)
-
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?contains(LoadBalancerName, '${{ env.ENVIRONMENT_NAME }}')].DNSName" \
+            --output text | head -n1)
           echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
-          echo "✓ Retrieved ALB DNS: $ALB_DNS"
 
-      - name: Display deployment summary
+      - name: Display summary
         run: |
           echo "=========================================="
-          echo "  Deployment Summary"
+          echo "  📦 Deployment Summary"
           echo "=========================================="
           echo ""
-          echo "Environment: ${{ env.ENVIRONMENT_NAME }}"
-          echo "Region: ${{ env.AWS_REGION }}"
-          echo "Commit: ${{ github.sha }}"
+          echo "Services Deployed:"
+          echo "  • Auth:     ${{ needs.deploy-auth.result }}"
+          echo "  • Users:    ${{ needs.deploy-users.result }}"
+          echo "  • Tasks:    ${{ needs.deploy-tasks.result }}"
+          echo "  • Frontend: ${{ needs.deploy-frontend.result }}"
           echo ""
-          echo "Application URL: http://${{ steps.get-alb-dns.outputs.alb_dns }}"
+          echo "Application URL: http://${{ steps.get-alb.outputs.alb_dns }}"
           echo ""
-          echo "Test endpoints:"
-          echo "  • Frontend: http://${{ steps.get-alb-dns.outputs.alb_dns }}/"
-          echo "  • Users:    http://${{ steps.get-alb-dns.outputs.alb_dns }}/signup"
-          echo "  • Tasks:    http://${{ steps.get-alb-dns.outputs.alb_dns }}/tasks"
-          echo ""
-          echo "Monitor deployment:"
-          echo "  aws ecs describe-services --cluster ${{ env.ENVIRONMENT_NAME }}-cluster --services ${{ env.ENVIRONMENT_NAME }}-auth-service"
-          echo "  aws logs tail /ecs/${{ env.ENVIRONMENT_NAME }} --follow"
+          echo "Changed Services:"
+          echo "  • Auth:     ${{ needs.detect-changes.outputs.auth }}"
+          echo "  • Users:    ${{ needs.detect-changes.outputs.users }}"
+          echo "  • Tasks:    ${{ needs.detect-changes.outputs.tasks }}"
+          echo "  • Frontend: ${{ needs.detect-changes.outputs.frontend }}"
           echo ""
           echo "=========================================="
-
-      - name: Check deployment status
-        if: ${{ needs.build-and-deploy.result == 'success' }}
-        run: |
-          echo "✅ All services deployed successfully!"
-
-      - name: Check deployment failures
-        if: ${{ needs.build-and-deploy.result != 'success' }}
-        run: |
-          echo "❌ Some services failed to deploy. Check the logs above."
-          exit 1
